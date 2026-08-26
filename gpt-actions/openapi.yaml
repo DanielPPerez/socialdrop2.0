@@ -1,0 +1,89 @@
+openapi: 3.1.0
+info:
+  title: socialdrop API
+  description: Publish videos to every social platform by dropping files in a folder.
+  version: 0.1.0
+servers:
+  - url: http://127.0.0.1:8643
+paths:
+  /drops:
+    get:
+      operationId: listDrops
+      summary: List video drops and their statuses
+      parameters:
+        - name: folder
+          in: query
+          schema: { type: string, default: "." }
+      responses:
+        "200":
+          description: Drop list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Drop"
+  /doctor:
+    get:
+      operationId: runDoctor
+      summary: Platform setup + validation report
+      parameters:
+        - name: folder
+          in: query
+          schema: { type: string, default: "." }
+      responses:
+        "200":
+          description: Report
+          content:
+            application/json:
+              schema: { type: object }
+  /publish:
+    post:
+      operationId: publishFolder
+      summary: Publish all due drops in a folder
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                folder: { type: string, default: "." }
+                only:
+                  type: array
+                  items: { type: string }
+                now: { type: boolean, default: false }
+      responses:
+        "200":
+          description: Publish results
+          content:
+            application/json:
+              schema: { type: object }
+  /stats:
+    post:
+      operationId: refreshStats
+      summary: Refresh consolidated insights into every md file
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                folder: { type: string, default: "." }
+      responses:
+        "200":
+          description: Metrics per video
+          content:
+            application/json:
+              schema: { type: object }
+components:
+  schemas:
+    Drop:
+      type: object
+      properties:
+        md: { type: string }
+        title: { type: string }
+        schedule: { type: ["string", "null"] }
+        platforms:
+          type: array
+          items: { type: string }
+        status: { type: string }
