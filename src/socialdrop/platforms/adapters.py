@@ -67,6 +67,25 @@ def raise_api_error(platform: str, resp: httpx.Response) -> None:
     raise PublishError(f"{platform} API error {resp.status_code}: {body}", retryable=retryable)
 
 
+YOUTUBE_CATEGORY_IDS = {
+    "film & animation": "1",
+    "music": "10",
+    "pets & animals": "15",
+    "sports": "17",
+    "travel & events": "19",
+    "gaming": "20",
+    "videoblogging": "21",
+    "people & blogs": "22",
+    "comedy": "23",
+    "entertainment": "24",
+    "news & politics": "25",
+    "howto & style": "26",
+    "education": "27",
+    "science & technology": "28",
+    "nonprofits & activism": "29",
+}
+
+
 class YouTubeAdapter(PlatformAdapter):
     name = "youtube"
     requires = ("google-api-python-client", "google-auth-oauthlib")
@@ -92,15 +111,27 @@ class YouTubeAdapter(PlatformAdapter):
         import os
 
         service, MediaFileUpload = self._service()
-        title = (meta.caption or "").splitlines()[0][:100] if meta.caption else video_path.stem[:100]
+        caption = meta.caption or ""
+        title = meta.get("title") or (caption.splitlines()[0] if caption else "") or video_path.stem
+        description = meta.get("description") or caption
+        raw_tags = meta.get("tags") or []
+        if isinstance(raw_tags, str):
+            raw_tags = [t.strip() for t in raw_tags.split(",")]
+        hashtags = meta.hashtags or []
+        tags = [str(t).strip().lstrip("#") for t in list(raw_tags) + hashtags if str(t).strip()]
+        category_id = YOUTUBE_CATEGORY_IDS.get(str(meta.get("category") or "").lower(), "22")
         body = {
             "snippet": {
-                "title": title,
-                "description": meta.caption or "",
-                "tags": [t.lstrip("#") for t in (meta.hashtags or [])],
-                "categoryId": "22",
+                "title": title[:100],
+                "description": description,
+                "tags": tags,
+                "categoryId": category_id,
             },
-            "status": {"privacyStatus": os.environ.get("SOCIALDROP_YOUTUBE_PRIVACY", "private")},
+            "status": {
+                "privacyStatus": os.environ.get("SOCIALDROP_YOUTUBE_PRIVACY", "private"),
+                "selfDeclaredMadeForKids": bool(meta.get("madeForKids", False)),
+                "license": "creativeCommon" if meta.get("license") == "creativeCommon" else "youtube",
+            },
         }
         media = MediaFileUpload(str(video_path), chunksize=8 * 1024 * 1024, resumable=True)
         request = service.videos().insert(part="snippet,status", body=body, media_body=media)

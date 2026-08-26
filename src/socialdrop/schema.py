@@ -71,6 +71,8 @@ class VideoDrop(BaseModel):
 
 
 def load_drop(md_path: Path) -> VideoDrop:
+    if md_path.suffix.lower() == ".json":
+        return _load_json_drop(md_path)
     video_path = video_for(md_path)
     if not video_path.exists():
         raise FileNotFoundError(f"no video file found next to {md_path.name}")
@@ -82,6 +84,49 @@ def load_drop(md_path: Path) -> VideoDrop:
     for cfg in meta.platforms.values():
         if not cfg.hashtags and meta.hashtags:
             cfg.hashtags = list(meta.hashtags)
+    if meta.schedule:
+        parse_schedule(meta.schedule)
+    return VideoDrop(path=video_path, meta=meta)
+
+
+JSON_PLATFORM_KEYS = (
+    "youtube",
+    "instagram",
+    "tiktok",
+    "x",
+    "linkedin",
+    "bluesky",
+    "facebook",
+    "threads",
+    "pinterest",
+    "mock",
+)
+
+
+def _load_json_drop(json_path: Path) -> VideoDrop:
+    import json
+
+    try:
+        data = json.loads(json_path.read_text())
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{json_path.name}: invalid JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"{json_path.name}: top level must be an object")
+
+    file_name = data.get("file")
+    if file_name:
+        video_path = json_path.parent / str(file_name)
+    else:
+        video_path = video_for(json_path)
+
+    platforms: dict[str, PlatformConfig] = {}
+    for key, value in data.items():
+        if isinstance(value, dict) and (key in JSON_PLATFORM_KEYS):
+            platforms[key] = PlatformConfig.model_validate(value)
+
+    title = data.get("title") or platforms.get("youtube", PlatformConfig()).get("title") or json_path.stem
+    schedule = data.get("schedule")
+    meta = VideoMeta(title=str(title), schedule=schedule, platforms=platforms)
     if meta.schedule:
         parse_schedule(meta.schedule)
     return VideoDrop(path=video_path, meta=meta)
@@ -104,7 +149,22 @@ def video_for(md_path: Path) -> Path:
 
 
 def find_drops(folder: Path) -> list[Path]:
-    return sorted(p for p in folder.glob("*.md") if video_for(p).exists())
+    md = (p for p in folder.glob("*.md") if video_for(p).exists())
+    json = (p for p in folder.glob("*.json") if _json_drop_video(p).exists())
+    return sorted({*md, *json})
+
+
+def _json_drop_video(json_path: Path) -> Path:
+    import json
+
+    try:
+        data = json.loads(json_path.read_text())
+        file_name = data.get("file")
+    except Exception:
+        file_name = None
+    if file_name:
+        return json_path.parent / str(file_name)
+    return video_for(json_path)
 
 
 def validate_drop_file(md_path: Path) -> list[str]:

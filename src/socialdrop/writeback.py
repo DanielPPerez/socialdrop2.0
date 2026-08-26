@@ -82,6 +82,9 @@ def _replace_block(content: str, start_marker: str, end_marker: str, new_block: 
 
 
 def write_results(md_path: Path, rows: list[PlatformRow]) -> None:
+    if md_path.suffix.lower() == ".json":
+        _write_json_block(md_path, "published", _json_published(rows))
+        return
     post = frontmatter.load(str(md_path))
     block = _render_published(rows)
     post.content = _replace_block(post.content, PUBLISHED_START, PUBLISHED_END, block)
@@ -89,8 +92,32 @@ def write_results(md_path: Path, rows: list[PlatformRow]) -> None:
 
 
 def write_insights(md_path: Path, metrics_rows: dict[str, dict]) -> None:
+    if md_path.suffix.lower() == ".json":
+        synced_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        _write_json_block(md_path, "insights", {"metrics": metrics_rows, "synced_at": synced_at})
+        return
     post = frontmatter.load(str(md_path))
     synced_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     block = _render_insights(metrics_rows, synced_at)
     post.content = _replace_block(post.content, INSIGHTS_START, INSIGHTS_END, block)
     frontmatter.dump(post, str(md_path))
+
+
+def _write_json_block(json_path: Path, key: str, value: dict) -> None:
+    import json
+
+    data = json.loads(json_path.read_text())
+    data[key] = value
+    json_path.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+
+
+def _json_published(rows: list[PlatformRow]) -> dict:
+    return {
+        row.platform: {
+            "status": row.status,
+            "url": row.url,
+            "posted_at": row.posted_at,
+            "error": row.error,
+        }
+        for row in rows
+    }

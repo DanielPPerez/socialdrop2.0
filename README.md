@@ -84,6 +84,33 @@ Frontmatter keys:
 
 The body of the file is the fallback description.
 
+## JSON sidecar (alternative format)
+
+Prefer JSON? A sibling `.json` file works too and carries richer YouTube metadata:
+
+```json
+{
+  "episode": "EI-002",
+  "file": "EI-002-Two-Kinds-Of-Memory.mp4",
+  "youtube": {
+    "title": "RAM vs Storage: Why Your Phone Calls Both of Them \"Space\"",
+    "description": "Full YouTube description...",
+    "tags": "ram vs storage, what is ram, phone memory explained",
+    "category": "Science & Technology",
+    "madeForKids": false,
+    "license": "standard"
+  },
+  "instagram": { "caption": "Short caption with #hashtags" },
+  "tiktok": { "caption": "Punchier hook for TikTok" }
+}
+```
+
+`file` points at the video explicitly; any top-level dict whose key is a known
+platform becomes that platform's config. After publishing, results are written
+back into the same JSON under `published`, and `stats` adds an `insights` block.
+Category names map to YouTube category IDs automatically (`Science & Technology`
+→ 28, etc.).
+
 After publishing, socialdrop appends idempotent `Published` and `Insights`
 sections (marked with HTML comments) so re-runs update rather than duplicate.
 
