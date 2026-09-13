@@ -13,8 +13,13 @@ FALLBACK_FILE = Path.home() / ".config" / "socialdrop" / "tokens.json"
 
 def _keyring_available() -> bool:
     try:
-        priority = keyring.get_keyring().priority
-        return priority is not None
+        import keyring.errors
+        kr = keyring.get_keyring()
+        if hasattr(kr, 'priority') and kr.priority is not None:
+            return True
+        return False
+    except keyring.errors.NoKeyringError:
+        return False
     except Exception:
         return False
 
