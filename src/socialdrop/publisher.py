@@ -7,14 +7,20 @@ from rich.console import Console
 from rich.progress import Progress
 
 from socialdrop import state as state_mod
+from socialdrop.auth import oauth
 from socialdrop.platforms.base import MAX_RETRIES, PublishError
+from socialdrop.platforms.exceptions import (
+    PlatformAuthError,
+    PlatformRateLimitError,
+    PlatformTimeoutError,
+)
 from socialdrop.schema import VideoDrop, load_drop
-from socialdrop.writeback import PlatformRow, write_results
+from socialdrop.writeback import PlatformRow, write_insights, write_results
 
 console = Console()
 
 
-def publish_drop(md_path: Path, only: list[str] | None = None, force: bool = False) -> dict:
+async def publish_drop(md_path: Path, only: list[str] | None = None, force: bool = False) -> dict:
     drop: VideoDrop = load_drop(md_path)
     state = state_mod.load_state(md_path)
     if state is None:
@@ -49,7 +55,17 @@ def publish_drop(md_path: Path, only: list[str] | None = None, force: bool = Fal
             state_mod.save_state(md_path, state)
             cfg = drop.meta.platforms[name]
             try:
-                result = adapter.publish(drop.path, cfg)
+                token = {} if adapter.name == "mock" else oauth.get_token(name)
+            except Exception as exc:
+                attempt.status = state_mod.STATUS_FAILED
+                attempt.error = f"auth: {exc}"
+                rows.append(PlatformRow(name, None, None, "failed", attempt.error))
+                console.print(f"  [red]❌ {name}: auth failed: {exc}[/red]")
+                progress.remove_task(task)
+                continue
+
+            try:
+                result = await adapter.publish(drop.path, cfg, token=token)
                 attempt.status = state_mod.STATUS_PUBLISHED
                 attempt.url = result.url
                 attempt.post_id = result.post_id
@@ -57,12 +73,27 @@ def publish_drop(md_path: Path, only: list[str] | None = None, force: bool = Fal
                 attempt.error = None
                 rows.append(PlatformRow(name, result.url, now_iso, "published"))
                 console.print(f"  [green]✅ {name}: {result.url or result.post_id}[/green]")
+            except PlatformTimeoutError as exc:
+                attempt.status = state_mod.STATUS_FAILED
+                attempt.error = str(exc)
+                rows.append(PlatformRow(name, attempt.url, attempt.published_at, "failed", str(exc)))
+                console.print(f"  [red]❌ {name}: {exc}[/red]")
+            except PlatformRateLimitError as exc:
+                attempt.status = state_mod.STATUS_FAILED
+                attempt.error = str(exc)
+                rows.append(PlatformRow(name, attempt.url, attempt.published_at, "failed", str(exc)))
+                console.print(f"  [red]❌ {name}: rate limited: {exc}[/red]")
+            except PlatformAuthError as exc:
+                attempt.status = state_mod.STATUS_FAILED
+                attempt.error = str(exc)
+                rows.append(PlatformRow(name, attempt.url, attempt.published_at, "failed", str(exc)))
+                console.print(f"  [red]❌ {name}: auth error: {exc}[/red]")
             except PublishError as exc:
                 attempt.status = state_mod.STATUS_FAILED
                 attempt.error = str(exc)
                 rows.append(PlatformRow(name, attempt.url, attempt.published_at, "failed", str(exc)))
                 console.print(f"  [red]❌ {name}: {exc}[/red]")
-            except Exception as exc:  # unexpected adapter crash
+            except Exception as exc:
                 attempt.status = state_mod.STATUS_FAILED
                 attempt.error = f"{type(exc).__name__}: {exc}"
                 rows.append(PlatformRow(name, None, None, "failed", attempt.error))
@@ -85,7 +116,7 @@ def _adapter_or_none(name: str):
         return None
 
 
-def publish_folder(folder: Path, only: list[str] | None = None, respect_schedule: bool = True) -> dict:
+async def publish_folder(folder: Path, only: list[str] | None = None, respect_schedule: bool = True) -> dict:
     results = {"published": 0, "skipped": 0, "failed": 0}
     md_files = load_drops(folder)
     for md_path in md_files:
@@ -93,7 +124,7 @@ def publish_folder(folder: Path, only: list[str] | None = None, respect_schedule
             console.print(f"[yellow]⏳ {md_path.stem}: waiting for schedule[/yellow]")
             results["skipped"] += 1
             continue
-        outcome = publish_drop(md_path, only=only)
+        outcome = await publish_drop(md_path, only=only)
         st = outcome["state"]
         if st.status == state_mod.STATUS_PUBLISHED:
             results["published"] += 1
@@ -110,7 +141,7 @@ def load_drops(folder: Path) -> list[Path]:
     return find_drops(folder)
 
 
-def collect_metrics(md_path: Path) -> dict[str, dict]:
+async def collect_metrics(md_path: Path) -> dict[str, dict]:
     drop = load_drop(md_path)
     state = state_mod.load_state(md_path)
     metrics: dict[str, dict] = {}
@@ -123,7 +154,17 @@ def collect_metrics(md_path: Path) -> dict[str, dict]:
         if adapter is None:
             continue
         try:
-            m = adapter.metrics(attempt.post_id, drop.meta.platforms[name])
+            token = oauth.get_access_token(name)
+        except Exception:
+            token = None
+        try:
+            m = await adapter.get_stats(attempt.post_id, drop.meta.platforms[name], token=token)
+        except PlatformAuthError as exc:
+            console.print(f"  [red]⚠ {name} metrics auth failed: {exc}[/red]")
+            continue
+        except PlatformRateLimitError as exc:
+            console.print(f"  [red]⚠ {name} metrics rate limited: {exc}[/red]")
+            continue
         except Exception as exc:
             console.print(f"  [red]⚠ {name} metrics failed: {exc}[/red]")
             continue
@@ -132,12 +173,10 @@ def collect_metrics(md_path: Path) -> dict[str, dict]:
     return metrics
 
 
-def sync_folder_stats(folder: Path) -> int:
-    from socialdrop.writeback import write_insights
-
+async def sync_folder_stats(folder: Path) -> int:
     count = 0
     for md_path in load_drops(folder):
-        metrics = collect_metrics(md_path)
+        metrics = await collect_metrics(md_path)
         if metrics:
             write_insights(md_path, metrics)
             console.print(f"[green]📊 {md_path.name}: updated insights for {len(metrics)} platform(s)[/green]")

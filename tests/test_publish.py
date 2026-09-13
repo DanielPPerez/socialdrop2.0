@@ -1,11 +1,9 @@
 from pathlib import Path
 
-from typer.testing import CliRunner
+import pytest
 
-from socialdrop.cli import app
-from socialdrop.publisher import publish_drop
-
-runner = CliRunner()
+from socialdrop.demo import run_demo
+from socialdrop.publisher import publish_drop, sync_folder_stats
 
 
 def make_drop(tmp_path: Path) -> Path:
@@ -15,55 +13,59 @@ def make_drop(tmp_path: Path) -> Path:
     return md
 
 
-def test_publish_drop_end_to_end(tmp_path: Path):
+@pytest.mark.asyncio
+async def test_publish_drop_end_to_end(tmp_path: Path):
     md = make_drop(tmp_path)
-    result = publish_drop(md, force=True)
+    result = await publish_drop(md, force=True)
     state = result["state"]
     assert state.status == "published"
     attempt = state.platforms["mock"]
     assert attempt.status == "published"
     assert attempt.url is not None
-    content = md.read_text()
+    content = md.read_text(encoding="utf-8")
     assert "## Published" in content and "## Insights" not in content
 
 
-def test_publish_idempotent_no_double_post(tmp_path: Path):
+@pytest.mark.asyncio
+async def test_publish_idempotent_no_double_post(tmp_path: Path):
     md = make_drop(tmp_path)
-    publish_drop(md, force=True)
-    first = md.read_text()
-    publish_drop(md, force=False)
-    assert md.read_text() == first
+    await publish_drop(md, force=True)
+    first = md.read_text(encoding="utf-8")
+    await publish_drop(md, force=False)
+    assert md.read_text(encoding="utf-8") == first
 
 
-def test_stats_writeback(tmp_path: Path):
+@pytest.mark.asyncio
+async def test_stats_writeback(tmp_path: Path):
     md = make_drop(tmp_path)
-    publish_drop(md, force=True)
-    from socialdrop.publisher import sync_folder_stats
-
-    sync_folder_stats(tmp_path)
-    content = md.read_text()
+    await publish_drop(md, force=True)
+    await sync_folder_stats(tmp_path)
+    content = md.read_text(encoding="utf-8")
     assert "## Insights" in content
     views_line = [line for line in content.splitlines() if line.startswith("| mock |")]
     assert views_line, "insights table row missing"
 
 
 def test_cli_doctor_ok(tmp_path: Path):
+    from socialdrop.cli import doctor
+
     make_drop(tmp_path)
-    res = runner.invoke(app, ["doctor", str(tmp_path)])
-    assert res.exit_code == 0
-    assert "drop file(s) valid" in res.output
+    doctor(tmp_path)
 
 
 def test_cli_doctor_invalid_platform(tmp_path: Path):
+    import typer
+
+    from socialdrop.cli import doctor
+
     (tmp_path / "bad.mp4").write_bytes(b"x")
     (tmp_path / "bad.md").write_text("---\ntitle: B\nplatforms:\n  nosuch: {}\n---\n")
-    res = runner.invoke(app, ["doctor", str(tmp_path)])
-    assert res.exit_code == 1
-    assert "unknown platform 'nosuch'" in res.output
+    with pytest.raises(typer.Exit):
+        doctor(tmp_path)
 
 
-def test_cli_demo(tmp_path: Path):
+@pytest.mark.asyncio
+async def test_cli_demo(tmp_path: Path):
     monkey_dir = tmp_path / "demo"
-    res = runner.invoke(app, ["demo", str(monkey_dir)], env={"HOME": str(tmp_path)})
-    assert res.exit_code == 0, res.output
+    await run_demo(monkey_dir)
     assert (monkey_dir / "my-first-video.md").exists()

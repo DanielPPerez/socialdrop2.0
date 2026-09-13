@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import time
+import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -11,12 +11,12 @@ from socialdrop.publisher import publish_folder
 console = Console()
 
 
-def run_loop(folder: Path, interval_seconds: int = 60, only: list[str] | None = None) -> None:
+async def run_loop(folder: Path, interval_seconds: int = 60, only: list[str] | None = None) -> None:
     console.print(f"[cyan]👀 watching {folder} (scan every {interval_seconds}s; Ctrl-C to stop)[/cyan]")
     try:
         while True:
             try:
-                results = publish_folder(folder, only=only, respect_schedule=True)
+                results = await publish_folder(folder, only=only, respect_schedule=True)
                 if results["published"] or results["failed"]:
                     console.print(
                         f"[bold]cycle:[/bold] published={results['published']} "
@@ -24,16 +24,12 @@ def run_loop(folder: Path, interval_seconds: int = 60, only: list[str] | None = 
                     )
             except Exception as exc:
                 console.print(f"[red]cycle error: {exc}[/red]")
-            _sleep(interval_seconds)
+            await asyncio.sleep(interval_seconds)
     except KeyboardInterrupt:
         console.print("[yellow]watch stopped[/yellow]")
 
 
-def _sleep(seconds: int) -> None:
-    time.sleep(seconds)
-
-
-def next_due(folder: Path) -> datetime | None:
+async def next_due(folder: Path) -> datetime | None:
     from socialdrop.schema import find_drops, load_drop, parse_schedule
 
     due_times = []

@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 
 class PlatformConfig(BaseModel):
+    account_id: str | None = None
     caption: str | None = None
     url: str | None = None
     hashtags: list[str] = Field(default_factory=list)

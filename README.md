@@ -1,11 +1,54 @@
 # socialdrop
 
+[![CI](https://github.com/DanielPPerez/socialdrop2.0/actions/workflows/ci.yml/badge.svg)](https://github.com/DanielPPerez/socialdrop2.0/actions/workflows/ci.yml)
+[![coverage](https://codecov.io/gh/DanielPPerez/socialdrop2.0/branch/main/graph/badge.svg)](https://codecov.io/gh/DanielPPerez/socialdrop2.0)
+[![license: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 **Drop a video and a markdown file into a folder. Every platform publishes itself.**
 
-socialdrop is an open-source, local-first publishing pipeline for short-form and
-long-form video. It watches a folder, reads a markdown sidecar for metadata and
-scheduling, publishes to every configured platform through official APIs, and
-writes results plus consolidated performance insights back into the same file.
+![dashboard demo](docs/assets/dashboard-demo.gif)
+
+```mermaid
+flowchart LR
+    A[Video + sidecar .md/.json] --> B[CLI core / API FastAPI]
+    B --> C{Job queue SQLite}
+    C --> D[Adapter: YouTube]
+    C --> E[Adapter: TikTok]
+    C --> F[Adapter: Instagram]
+    C --> G[Adapter: X]
+    C --> H[Adapter: LinkedIn]
+    C --> I[Adapter: Bluesky]
+    D & E & F & G & H & I --> J[(Writeback sidecar)]
+    J --> K[Published + Insights blocks]
+    B --> L[Frontend Next.js]
+    L --> M[SSE events]
+```
+
+## Install
+
+```bash
+pipx install socialdrop            # core
+pipx inject socialdrop socialdrop[youtube,bluesky,watch]   # optional extras
+```
+
+## Quickstart
+
+```bash
+git clone https://github.com/DanielPPez/socialdrop2.0
+cd socialdrop2.0
+cp vendor/socialdrop/.env.example vendor/socialdrop/.env
+docker compose up --build
+```
+
+Open `http://localhost:3000` (frontend) and `http://localhost:8001/docs` (API).
+
+## How it works
+
+1. **Drop folder**: put a video (`my-video.mp4`) next to a sidecar (`my-video.md` or `.json`).
+2. **Sidecar metadata**: frontmatter YAML/JSON with title, schedule, platforms config.
+3. **Publish**: API or CLI queues jobs per platform. Adapters use official OAuth APIs.
+4. **Writeback**: results are appended idempotently into the same sidecar under `<!-- socialdrop:published:start -->` and `<!-- socialdrop:insights:start -->`.
+5. **Insights**: `stats` refreshes metrics and writes a consolidated table.
 
 ```markdown
 ---
@@ -20,113 +63,46 @@ hashtags: [buildinpublic]
 ---
 ```
 
-Drop `my-launch-video.mp4` next to it and run `socialdrop watch`. The md file
-fills itself in with per-platform links, then a live Insights table:
+## Screenshots
 
-| Platform | Views | Likes | Comments | Shares |
-|---|---|---|---|---|
-| youtube | 12.4k | 890 | 45 | — |
-| tiktok | 45k | 3.1k | 210 | 890 |
+### Connect account
+![connect](docs/assets/connect.png)
 
-## Install
+### Create drop
+![create](docs/assets/create.png)
 
-```bash
-pipx install socialdrop            # core
-pipx inject socialdrop socialdrop[youtube,bluesky,watch]   # optional extras
-```
+### Publish and insights
+![published](docs/assets/published.png)
 
-## Quickstart (no accounts needed)
+## Architecture
 
-```bash
-socialdrop demo
-```
+- **CLI** (`vendor/socialdrop/src/socialdrop/cli.py`): Typer commands for local use.
+- **API** (`vendor/socialdrop/src/socialdrop/api/`): FastAPI async, same adapters as CLI.
+- **Frontend** (`web/`): Next.js + TanStack Query + SSE.
+- **Queue**: SQLite-backed job queue with exponential backoff.
+- **Notifications**: Discord webhook and SMTP.
+- **Logs**: structlog JSON, correlated by `drop_id`.
 
-Creates `demo/`, generates a sample video, "publishes" it to the built-in
-mock platform, and writes the Published + Insights tables back into the md file.
+## Demo GIF
 
-## Connect real platforms
+To record the dashboard demo GIF:
 
-| Platform | How auth works | Notes before first publish |
-|---|---|---|
-| YouTube | OAuth (`socialdrop auth login youtube`) | Unaudited apps upload as private; request a compliance audit to go public |
-| TikTok | OAuth | Direct Post requires an audited client; otherwise private-only |
-| Instagram | OAuth via Meta | Needs an IG Business/Creator account + Meta app review |
-| X | OAuth PKCE | Pay-per-use credits on your own account |
-| LinkedIn | OAuth (`w_member_social`) | Personal posts work self-serve; Company Pages need partner approval |
-| Bluesky | App password only | Fully open, no review; never your main password |
+1. Start the stack with `docker compose up --build`
+2. Open `http://localhost:3000`
+3. Run `python docs/record_demo_gif.py` (requires `ffmpeg`)
+4. Replace `docs/assets/dashboard-demo.gif` with the recorded file
+5. Run `python docs/take_screenshots.py` and save the screenshots into `docs/assets/`
 
-Passwords are **never** stored or transmitted. Tokens live in your OS keyring
-(fallback: 0600 file) and are refreshed automatically.
+## Deploy public demo
 
-## CLI
+See [docs/DEPLOY.md](docs/DEPLOY.md).
 
-```
-socialdrop doctor              # what is set up, what is missing
-socialdrop auth login <p>      # connect a platform
-socialdrop publish [folder]    # publish everything due now
-socialdrop watch [folder]      # live folder watching
-socialdrop stats [folder]      # refresh Insights tables
-socialdrop demo                # end-to-end mock run
-```
+We recommend **Railway** for a public demo because it runs Docker Compose
+natively and gives you a public URL in minutes.
 
-## Markdown sidecar schema
+## Contributing
 
-Frontmatter keys:
-
-- `title` (required): default title everywhere.
-- `schedule` (optional): `YYYY-MM-DD HH:MM TZ`, e.g. `2026-08-30 10:00 Europe/Berlin`.
-- `platforms` (required): map of platform → config. Per-platform keys:
-  - `caption`: overrides title/description for that platform.
-  - `url`: public video URL (Instagram requires this unless rupload succeeds).
-  - `hashtags`: platform-specific tags; falls back to global list.
-  - platform extras: `visibility` (youtube), `privacy`/`duet` (tiktok), etc.
-- `hashtags` (optional): global tags merged into captions.
-
-The body of the file is the fallback description.
-
-## JSON sidecar (alternative format)
-
-Prefer JSON? A sibling `.json` file works too and carries richer YouTube metadata:
-
-```json
-{
-  "episode": "EI-002",
-  "file": "EI-002-Two-Kinds-Of-Memory.mp4",
-  "youtube": {
-    "title": "RAM vs Storage: Why Your Phone Calls Both of Them \"Space\"",
-    "description": "Full YouTube description...",
-    "tags": "ram vs storage, what is ram, phone memory explained",
-    "category": "Science & Technology",
-    "madeForKids": false,
-    "license": "standard"
-  },
-  "instagram": { "caption": "Short caption with #hashtags" },
-  "tiktok": { "caption": "Punchier hook for TikTok" }
-}
-```
-
-`file` points at the video explicitly; any top-level dict whose key is a known
-platform becomes that platform's config. After publishing, results are written
-back into the same JSON under `published`, and `stats` adds an `insights` block.
-Category names map to YouTube category IDs automatically (`Science & Technology`
-→ 28, etc.).
-
-After publishing, socialdrop appends idempotent `Published` and `Insights`
-sections (marked with HTML comments) so re-runs update rather than duplicate.
-
-## Agents welcome
-
-socialdrop is built agent-first: thin deterministic CLIs any LLM can drive.
-
-- Claude Code skills live in [`skills/`](skills/) — copy into `~/.claude/skills/`.
-- MCP server in [`mcp/`](mcp/) exposing `list_drops`, `publish`, `get_stats`.
-- GPT Actions OpenAPI spec in [`gpt-actions/openapi.yaml`](gpt-actions/openapi.yaml).
-
-## Why official APIs only
-
-Browser automation gets accounts banned. Every adapter here uses the platform's
-sanctioned OAuth APIs, so worst case is a delayed feature while an audit is
-pending — never a banned account.
+See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 

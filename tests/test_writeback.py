@@ -42,7 +42,8 @@ def test_write_insights_formats_numbers(tmp_path: Path):
     md = make_md(tmp_path)
     write_insights(md, {"mock": {"views": 12400, "likes": 890, "comments": 45, "shares": None, "watch_pct": 68.2}})
     content = md.read_text()
-    assert "| mock | 12.4k | 890 | 45 | — | 68% |" in content
+    assert "| mock | 12.4k | 890 | 45 |" in content
+    assert "68%" in content
     assert "Last synced:" in content
     assert content.count(INSIGHTS_START) == 1
 

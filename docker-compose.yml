@@ -1,0 +1,30 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8001:8000"
+    volumes:
+      - ./drops:/drops
+      - ./tokens:/root/.config/socialdrop
+    environment:
+      - SOCIALDROP_API_KEY=${SOCIALDROP_API_KEY:-change-me}
+      - SOCIALDROP_API_DROPS_FOLDER=/drops
+      - FRONTEND_ORIGIN=${FRONTEND_ORIGIN:-*}
+      - SOCIALDROP_DISCORD_WEBHOOK=${SOCIALDROP_DISCORD_WEBHOOK:-}
+    command: ["python", "-m", "uvicorn", "socialdrop.api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-http://localhost:8001}
+      - NEXT_PUBLIC_API_KEY=${NEXT_PUBLIC_API_KEY:-change-me}
+    depends_on:
+      - api
+    restart: unless-stopped

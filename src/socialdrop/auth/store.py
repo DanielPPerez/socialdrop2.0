@@ -10,6 +10,7 @@ import keyring
 SERVICE = "socialdrop"
 FALLBACK_FILE = Path.home() / ".config" / "socialdrop" / "tokens.json"
 
+
 def _keyring_available() -> bool:
     try:
         priority = keyring.get_keyring().priority
@@ -18,44 +19,53 @@ def _keyring_available() -> bool:
         return False
 
 
-def save_token(platform: str, token: dict) -> None:
+def _token_key(platform: str, account_id: str | None = None) -> str:
+    if account_id:
+        return f"{platform}:{account_id}"
+    return platform
+
+
+def save_token(platform: str, token: dict, account_id: str | None = None) -> None:
+    key = _token_key(platform, account_id)
     payload = json.dumps(token)
     if _keyring_available():
-        keyring.set_password(SERVICE, platform, payload)
+        keyring.set_password(SERVICE, key, payload)
         return
     FALLBACK_FILE.parent.mkdir(parents=True, exist_ok=True)
     tokens = _read_fallback()
-    tokens[platform] = token
+    tokens[key] = token
     FALLBACK_FILE.write_text(json.dumps(tokens, indent=2))
     os.chmod(FALLBACK_FILE, stat.S_IRUSR | stat.S_IWUSR)
 
 
-def load_token(platform: str) -> dict | None:
+def load_token(platform: str, account_id: str | None = None) -> dict | None:
+    key = _token_key(platform, account_id)
     if _keyring_available():
-        raw = keyring.get_password(SERVICE, platform)
+        raw = keyring.get_password(SERVICE, key)
         if raw:
             return json.loads(raw)
         return None
-    return _read_fallback().get(platform)
+    return _read_fallback().get(key)
 
 
-def delete_token(platform: str) -> None:
+def delete_token(platform: str, account_id: str | None = None) -> None:
+    key = _token_key(platform, account_id)
     if _keyring_available():
         try:
-            keyring.delete_password(SERVICE, platform)
+            keyring.delete_password(SERVICE, key)
             return
         except Exception:
             pass
     tokens = _read_fallback()
-    tokens.pop(platform, None)
+    tokens.pop(key, None)
     FALLBACK_FILE.parent.mkdir(parents=True, exist_ok=True)
     FALLBACK_FILE.write_text(json.dumps(tokens, indent=2))
 
 
 def configured_platforms() -> list[str]:
-    from socialdrop.platforms.registry import names
+    from socialdrop.platforms import registry
 
-    return [name for name in names() if load_token(name) is not None]
+    return [name for name in registry.names() if any(load_token(name) is not None for _ in [None])]
 
 
 def _read_fallback() -> dict:

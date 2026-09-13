@@ -6,6 +6,8 @@ from typing import Any
 
 from pydantic import BaseModel
 
+from socialdrop.platforms.exceptions import PlatformError
+
 MAX_RETRIES = 3
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 
@@ -29,24 +31,24 @@ class Metrics(BaseModel):
         return any(v is not None for v in (self.views, self.likes, self.comments, self.shares, self.watch_pct))
 
 
-class PublishError(Exception):
+class PublishError(PlatformError):
     def __init__(self, message: str, retryable: bool = False):
         super().__init__(message)
         self.retryable = retryable
 
 
-class PlatformAdapter(ABC):
+class BasePlatformAdapter(ABC):
     name: str = "base"
     requires: tuple[str, ...] = ()
 
     @abstractmethod
-    def publish(self, video_path: Path, meta: Any) -> PublishResult:
+    async def publish(self, video_path: Path, meta: Any, token: dict | None = None) -> PublishResult:
         ...
 
-    def metrics(self, post_id: str, meta: Any) -> Metrics | None:
+    async def get_stats(self, post_id: str, meta: Any, token: dict | None = None) -> Metrics | None:
         return None
 
-    def is_ready(self) -> tuple[bool, str]:
+    async def is_ready(self) -> tuple[bool, str]:
         import os
 
         from socialdrop.auth.store import load_token
@@ -56,3 +58,9 @@ class PlatformAdapter(ABC):
         if os.environ.get(f"SOCIALDROP_{self.name.upper()}_ACCESS_TOKEN"):
             return True, "access token via environment"
         return False, f"not authenticated; run 'socialdrop auth login {self.name}'"
+
+    async def authenticate(self, redirect_uri: str | None = None) -> dict:
+        raise NotImplementedError(f"{self.name} does not support browser OAuth")
+
+
+PlatformAdapter = BasePlatformAdapter

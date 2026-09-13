@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 from pathlib import Path
 
@@ -13,7 +14,7 @@ DEBOUNCE_SECONDS = 2.0
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".webm", ".m4v", ".mkv", ".md"}
 
 
-def watch_folder(folder: Path, only: list[str] | None = None) -> None:
+async def watch_folder(folder: Path, only: list[str] | None = None) -> None:
     try:
         from watchdog.events import FileSystemEventHandler
         from watchdog.observers import Observer
@@ -38,11 +39,11 @@ def watch_folder(folder: Path, only: list[str] | None = None) -> None:
         def _debounced(self, src_path):
             console.print(f"[cyan]📥 detected {Path(src_path).name}[/cyan]")
             time.sleep(DEBOUNCE_SECONDS)
-            run_cycle(folder, only)
+            asyncio.run(run_cycle(folder, only))
 
-    def run_cycle(target: Path, only: list[str] | None):
+    async def run_cycle(target: Path, only: list[str] | None):
         try:
-            results = publish_folder(target, only=only, respect_schedule=True)
+            results = await publish_folder(target, only=only, respect_schedule=True)
             console.print(
                 f"[bold]published={results['published']} failed={results['failed']} waiting={results['skipped']}[/bold]"
             )
@@ -53,7 +54,7 @@ def watch_folder(folder: Path, only: list[str] | None = None) -> None:
     observer.schedule(DropHandler(), str(folder), recursive=False)
     observer.start()
     console.print(f"[cyan]👀 watching {folder} — drop video + md to publish (Ctrl-C to stop)[/cyan]")
-    run_cycle(folder, only)
+    await run_cycle(folder, only)
     try:
         while True:
             time.sleep(1)

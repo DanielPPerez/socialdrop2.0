@@ -9,6 +9,10 @@ build/
 .mypy_cache/
 .ruff_cache/
 .coverage
+coverage.xml
 .env
+.env.example
 .socialdrop/
 demo/
+socialdrop_jobs.db
+openapi.json

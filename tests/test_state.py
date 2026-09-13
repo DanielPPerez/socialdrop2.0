@@ -27,7 +27,8 @@ def test_status_transitions_to_published(tmp_path: Path):
     attempt.status = "published"
     state_mod.save_state(md, st)
     assert st.status == "published"
-    assert state_mod.load_state(md).all_published
+    loaded = state_mod.load_state(md)
+    assert loaded is not None and loaded.all_published
 
 
 def test_is_due_without_schedule(tmp_path: Path):
@@ -54,6 +55,7 @@ def test_reset_platform_clears_error(tmp_path: Path):
     state_mod.save_state(md, st)
     state_mod.reset_platform(md, "mock")
     reloaded = state_mod.load_state(md)
+    assert reloaded is not None
     assert reloaded.platforms["mock"].status == "discovered"
     assert reloaded.platforms["mock"].error is None
 

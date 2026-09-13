@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 from pathlib import Path
 
@@ -8,20 +9,23 @@ import httpx
 from socialdrop.platforms.base import (
     MAX_RETRIES,
     RETRYABLE_STATUS,
+    BasePlatformAdapter,
     Metrics,
-    PlatformAdapter,
     PublishError,
     PublishResult,
+)
+from socialdrop.platforms.exceptions import (
+    PlatformAuthError,
+    PlatformRateLimitError,
+    PlatformTimeoutError,
 )
 from socialdrop.schema import PlatformConfig
 
 
-class MockAdapter(PlatformAdapter):
-    """Always succeeds without network. Used by 'socialdrop demo' and tests."""
-
+class MockAdapter(BasePlatformAdapter):
     name = "mock"
 
-    def publish(self, video_path: Path, meta: PlatformConfig) -> PublishResult:
+    async def publish(self, video_path: Path, meta: PlatformConfig, token: dict | None = None) -> PublishResult:
         return PublishResult(
             platform=self.name,
             url=f"https://mock.social/@demo/video/{video_path.stem}",
@@ -29,7 +33,7 @@ class MockAdapter(PlatformAdapter):
             raw={"simulated": True},
         )
 
-    def metrics(self, post_id: str, meta: PlatformConfig) -> Metrics:
+    async def get_stats(self, post_id: str, meta: PlatformConfig, token: dict | None = None) -> Metrics | None:
         seed = sum(ord(c) for c in post_id) % 1000
         return Metrics(
             views=1000 + seed * 7,
@@ -39,24 +43,40 @@ class MockAdapter(PlatformAdapter):
             raw={"simulated": True},
         )
 
-    def is_ready(self) -> tuple[bool, str]:
+    async def is_ready(self) -> tuple[bool, str]:
         return True, "mock always ready"
 
+    async def authenticate(self, redirect_uri: str | None = None) -> dict:
+        return {"access_token": "mock-token", "expires_at": int(time.time()) + 3600}
 
-def _request_with_retry(client: httpx.Client, method: str, url: str, **kwargs) -> httpx.Response:
+
+async def _request_with_retry(client: httpx.AsyncClient, method: str, url: str, **kwargs) -> httpx.Response:
     last_error = ""
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            resp = client.request(method, url, **kwargs)
+            resp = await client.request(method, url, **kwargs)
+        except httpx.TimeoutException:
+            last_error = "timeout"
+            if attempt == MAX_RETRIES:
+                raise PlatformTimeoutError(
+                    f"{method} {url} timed out after {MAX_RETRIES} attempts"
+                ) from None
+            await asyncio.sleep(min(2**attempt, 30))
+            continue
         except httpx.TransportError as exc:
             last_error = str(exc)
-            resp = None  # type: ignore[assignment]
-        if resp is not None and resp.status_code not in RETRYABLE_STATUS:
+            if attempt == MAX_RETRIES:
+                raise PublishError(
+                    f"{method} {url} failed after {MAX_RETRIES} attempts: {last_error}", retryable=True
+                ) from None
+            await asyncio.sleep(min(2**attempt, 30))
+            continue
+        if resp.status_code not in RETRYABLE_STATUS:
             return resp
         if attempt == MAX_RETRIES:
             break
-        time.sleep(min(2**attempt, 30))
-    raise PublishError(f"{method} {url} failed after {MAX_RETRIES} attempts: {last_error}", retryable=True)
+        await asyncio.sleep(min(2**attempt, 30))
+    raise PlatformRateLimitError(f"{method} {url} failed after {MAX_RETRIES} attempts: {last_error}")
 
 
 def raise_api_error(platform: str, resp: httpx.Response) -> None:
@@ -64,6 +84,12 @@ def raise_api_error(platform: str, resp: httpx.Response) -> None:
         return
     body = resp.text[:500]
     retryable = resp.status_code in RETRYABLE_STATUS
+    if resp.status_code == 401:
+        raise PlatformAuthError(f"{platform} API error {resp.status_code}: {body}")
+    if resp.status_code == 403:
+        raise PlatformAuthError(f"{platform} API error {resp.status_code}: {body}")
+    if resp.status_code == 429:
+        raise PlatformRateLimitError(f"{platform} API error {resp.status_code}: {body}")
     raise PublishError(f"{platform} API error {resp.status_code}: {body}", retryable=retryable)
 
 
@@ -86,31 +112,16 @@ YOUTUBE_CATEGORY_IDS = {
 }
 
 
-class YouTubeAdapter(PlatformAdapter):
+class YouTubeAdapter(BasePlatformAdapter):
     name = "youtube"
-    requires = ("google-api-python-client", "google-auth-oauthlib")
+    requires = ()
 
-    def _service(self):
-        try:
-            from google.oauth2.credentials import Credentials
-            from googleapiclient.discovery import build
-            from googleapiclient.http import MediaFileUpload
-        except ImportError as exc:
-            raise PublishError(
-                f"missing dependency; install with: pip install socialdrop[youtube] ({exc})"
-            ) from exc
-        from socialdrop.auth import store
-
-        token = store.load_token(self.name)
+    async def publish(self, video_path: Path, meta: PlatformConfig, token: dict | None = None) -> PublishResult:
         if token is None:
-            raise PublishError("youtube not authenticated", retryable=False)
-        creds = Credentials(token=token["access_token"], refresh_token=token.get("refresh_token"))
-        return build("youtube", "v3", credentials=creds), MediaFileUpload
-
-    def publish(self, video_path: Path, meta: PlatformConfig) -> PublishResult:
-        import os
-
-        service, MediaFileUpload = self._service()
+            raise PlatformAuthError("youtube not authenticated")
+        access_token = token.get("access_token") or token.get("token")
+        if not access_token:
+            raise PlatformAuthError("youtube token missing access_token")
         caption = meta.caption or ""
         title = meta.get("title") or (caption.splitlines()[0] if caption else "") or video_path.stem
         description = meta.get("description") or caption
@@ -128,44 +139,93 @@ class YouTubeAdapter(PlatformAdapter):
                 "categoryId": category_id,
             },
             "status": {
-                "privacyStatus": os.environ.get("SOCIALDROP_YOUTUBE_PRIVACY", "private"),
+                "privacyStatus": "private",
                 "selfDeclaredMadeForKids": bool(meta.get("madeForKids", False)),
                 "license": "creativeCommon" if meta.get("license") == "creativeCommon" else "youtube",
             },
         }
-        media = MediaFileUpload(str(video_path), chunksize=8 * 1024 * 1024, resumable=True)
-        request = service.videos().insert(part="snippet,status", body=body, media_body=media)
-        response: dict = {}
-        while not response:
-            _, response = request.next_chunk()
-        video_id = response["id"]
+        async with httpx.AsyncClient(timeout=120) as client:
+            headers = {
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json; charset=UTF-8",
+                "X-Upload-Content-Type": "video/mp4",
+            }
+            init = await _request_with_retry(
+                client,
+                "POST",
+                "https://www.googleapis.com/upload/youtube/v3/videos",
+                params={"part": "snippet,status", "uploadType": "resumable"},
+                json=body,
+                headers=headers,
+            )
+            raise_api_error(self.name, init)
+            upload_url = init.headers.get("Location")
+            if not upload_url:
+                raise PublishError("youtube init missing Location header", retryable=True)
+
+            size = video_path.stat().st_size
+            with open(video_path, "rb") as fh:
+                data = fh.read()
+            put = await client.put(
+                upload_url,
+                content=data,
+                headers={
+                    "Content-Type": "video/mp4",
+                    "Content-Range": f"bytes 0-{size - 1}/{size}",
+                },
+            )
+            if put.status_code == 308:
+                raise PublishError("youtube resumable upload requires chunking", retryable=False)
+            raise_api_error(self.name, put)
+            video_id = put.json().get("id")
+            if not video_id:
+                raise PublishError("youtube upload response missing id", retryable=True)
         return PublishResult(
-            platform=self.name, url=f"https://youtu.be/{video_id}", post_id=video_id, raw=response
+            platform=self.name,
+            url=f"https://youtu.be/{video_id}",
+            post_id=video_id,
+            raw=put.json(),
         )
 
-    def metrics(self, post_id: str, meta: PlatformConfig) -> Metrics | None:
-        service, _ = self._service()
-        resp = service.videos().list(part="statistics", id=post_id).execute()
-        items = resp.get("items", [])
-        if not items:
+    async def get_stats(self, post_id: str, meta: PlatformConfig, token: dict | None = None) -> Metrics | None:
+        if token is None:
             return None
-        stats = items[0].get("statistics", {})
-        return Metrics(
-            views=int(stats.get("viewCount", 0)) or None,
-            likes=int(stats.get("likeCount", 0)) or None,
-            comments=int(stats.get("commentCount", 0)) or None,
-            raw=stats,
-        )
+        access_token = token.get("access_token") or token.get("token")
+        if not access_token:
+            return None
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(
+                "https://www.googleapis.com/youtube/v3/videos",
+                params={"part": "statistics", "id": post_id},
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+            if resp.status_code == 401:
+                raise PlatformAuthError("youtube stats auth failed")
+            if resp.status_code >= 400:
+                raise PublishError(f"youtube stats error {resp.status_code}", retryable=True)
+            items = resp.json().get("items", [])
+            if not items:
+                return None
+            stats = items[0].get("statistics", {})
+            return Metrics(
+                views=int(stats.get("viewCount", 0)) or None,
+                likes=int(stats.get("likeCount", 0)) or None,
+                comments=int(stats.get("commentCount", 0)) or None,
+                raw=stats,
+            )
 
 
-class TikTokAdapter(PlatformAdapter):
+class TikTokAdapter(BasePlatformAdapter):
     name = "tiktok"
     API = "https://open.tiktokapis.com/v2"
 
-    def publish(self, video_path: Path, meta: PlatformConfig) -> PublishResult:
-        from socialdrop.auth.oauth import get_access_token
-
-        headers = {"Authorization": f"Bearer {get_access_token('tiktok')}"}
+    async def publish(self, video_path: Path, meta: PlatformConfig, token: dict | None = None) -> PublishResult:
+        if token is None:
+            raise PlatformAuthError("tiktok not authenticated")
+        access_token = token.get("access_token")
+        if not access_token:
+            raise PlatformAuthError("tiktok token missing access_token")
+        headers = {"Authorization": f"Bearer {access_token}"}
         privacy = meta.get("privacy", "PUBLIC_TO_EVERYONE")
         init_body = {
             "post_info": {
@@ -178,21 +238,22 @@ class TikTokAdapter(PlatformAdapter):
             "source_info": {
                 "source": "FILE_UPLOAD",
                 "video_size": video_path.stat().st_size,
-                "chunk_size": min(video_path.stat().st_size, 64 * 1024 * 1024),
+                "chunk_size": video_path.stat().st_size,
                 "total_chunk_count": 1,
             },
         }
-        with httpx.Client(timeout=120) as client:
-            resp = _request_with_retry(
+        async with httpx.AsyncClient(timeout=120) as client:
+            resp = await _request_with_retry(
                 client, "POST", f"{self.API}/post/publish/video/init/", json=init_body, headers=headers
             )
             raise_api_error(self.name, resp)
             data = resp.json()
-            if data.get("error", {}).get("code") not in ("ok", ""):
-                raise PublishError(f"tiktok init failed: {data['error']}")
+            error = data.get("error", {})
+            if error.get("code") not in ("ok", "", 0, None):
+                raise PublishError(f"tiktok init failed: {error}")
             upload_url = data["data"]["upload_url"]
             with open(video_path, "rb") as fh:
-                put = _request_with_retry(
+                put = await _request_with_retry(
                     client,
                     "PUT",
                     upload_url,
@@ -213,47 +274,42 @@ class TikTokAdapter(PlatformAdapter):
         )
 
 
-class InstagramAdapter(PlatformAdapter):
-    """Requires an Instagram Business/Creator account and a public video URL.
-
-    Meta fetches video_url itself; local files are uploaded via the resumable
-    endpoint when possible, otherwise set platforms.instagram.url in frontmatter.
-    """
-
+class InstagramAdapter(BasePlatformAdapter):
     name = "instagram"
     GRAPH = "https://graph.facebook.com/v21.0"
 
-    def publish(self, video_path: Path, meta: PlatformConfig) -> PublishResult:
-        from socialdrop.auth.oauth import get_access_token
-
-        token = get_access_token("instagram")
+    async def publish(self, video_path: Path, meta: PlatformConfig, token: dict | None = None) -> PublishResult:
+        if token is None:
+            raise PlatformAuthError("instagram not authenticated")
+        access_token = token.get("access_token")
+        if not access_token:
+            raise PlatformAuthError("instagram token missing access_token")
         ig_user_id = meta.get("ig_user_id")
         if not ig_user_id:
-            ig_user_id = self._resolve_ig_user_id(token)
+            ig_user_id = await self._resolve_ig_user_id(access_token)
         caption = meta.caption or ""
-
         params = {
             "media_type": "REELS",
             "caption": caption,
-            "access_token": token,
+            "access_token": access_token,
         }
         public_url = meta.url
         if public_url:
             params["video_url"] = public_url
-        with httpx.Client(timeout=120) as client:
-            resp = _request_with_retry(client, "POST", f"{self.GRAPH}/{ig_user_id}/media", data=params)
+        async with httpx.AsyncClient(timeout=120) as client:
+            resp = await _request_with_retry(client, "POST", f"{self.GRAPH}/{ig_user_id}/media", data=params)
             raise_api_error(self.name, resp)
             container_id = resp.json()["id"]
 
             if not public_url:
-                self._rupload(client, container_id, video_path, token)
+                await self._rupload(client, container_id, video_path, access_token)
 
-            status = self._wait_container(client, container_id, token)
-            pub = _request_with_retry(
+            status = await self._wait_container(client, container_id, access_token)
+            pub = await _request_with_retry(
                 client,
                 "POST",
                 f"{self.GRAPH}/{ig_user_id}/media_publish",
-                data={"creation_id": container_id, "access_token": token},
+                data={"creation_id": container_id, "access_token": access_token},
             )
             raise_api_error(self.name, pub)
             media_id = pub.json().get("id")
@@ -266,27 +322,25 @@ class InstagramAdapter(PlatformAdapter):
             raw={"container": container_id, "publish": pub.json()},
         )
 
-    def _resolve_ig_user_id(self, token: str) -> str:
-        with httpx.Client(timeout=60) as client:
-            resp = client.get(f"{self.GRAPH}/me/accounts", params={"access_token": token})
+    async def _resolve_ig_user_id(self, token: str) -> str:
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.get(f"{self.GRAPH}/me/accounts", params={"access_token": token})
             raise_api_error(self.name, resp)
             pages = resp.json().get("data", [])
             if not pages:
-                raise PublishError(
-                    "no Facebook Page found; link your IG Business account to a Page first"
-                )
+                raise PlatformAuthError("no Facebook Page found; link your IG Business account to a Page first")
             page_id = pages[0]["id"]
-            resp = client.get(
+            resp = await client.get(
                 f"{self.GRAPH}/{page_id}",
                 params={"fields": "instagram_business_account", "access_token": token},
             )
             raise_api_error(self.name, resp)
             ig = resp.json().get("instagram_business_account")
             if not ig:
-                raise PublishError("no Instagram Business account linked to the first Page")
+                raise PlatformAuthError("no Instagram Business account linked to the first Page")
             return ig["id"]
 
-    def _rupload(self, client: httpx.Client, container_id: str, video_path: Path, token: str) -> None:
+    async def _rupload(self, client: httpx.AsyncClient, container_id: str, video_path: Path, token: str) -> None:
         size = video_path.stat().st_size
         headers = {
             "Authorization": f"OAuth {token}",
@@ -294,7 +348,7 @@ class InstagramAdapter(PlatformAdapter):
             "file_size": str(size),
         }
         with open(video_path, "rb") as fh:
-            resp = client.post(
+            resp = await client.post(
                 f"https://rupload.facebook.com/ig-api-upload/{container_id}",
                 headers=headers,
                 content=fh.read(),
@@ -302,12 +356,12 @@ class InstagramAdapter(PlatformAdapter):
         if resp.status_code >= 400:
             raise PublishError(f"instagram rupload failed: {resp.status_code} {resp.text[:300]}")
 
-    def _wait_container(self, client: httpx.Client, container_id: str, token: str, timeout: int = 600) -> dict:
-        import time
-
+    async def _wait_container(
+        self, client: httpx.AsyncClient, container_id: str, token: str, timeout: int = 600
+    ) -> dict:
         deadline = time.time() + timeout
         while time.time() < deadline:
-            resp = _request_with_retry(
+            resp = await _request_with_retry(
                 client,
                 "GET",
                 f"{self.GRAPH}/{container_id}",
@@ -320,21 +374,24 @@ class InstagramAdapter(PlatformAdapter):
                 return data
             if code == "ERROR":
                 raise PublishError(f"instagram container error: {data.get('status')}")
-            time.sleep(5)
+            await asyncio.sleep(5)
         raise PublishError("instagram container timed out", retryable=True)
 
 
-class XAdapter(PlatformAdapter):
+class XAdapter(BasePlatformAdapter):
     name = "x"
     API = "https://api.x.com/2"
 
-    def publish(self, video_path: Path, meta: PlatformConfig) -> PublishResult:
-        from socialdrop.auth.oauth import get_access_token
-
-        headers = {"Authorization": f"Bearer {get_access_token('x')}"}
+    async def publish(self, video_path: Path, meta: PlatformConfig, token: dict | None = None) -> PublishResult:
+        if token is None:
+            raise PlatformAuthError("x not authenticated")
+        access_token = token.get("access_token")
+        if not access_token:
+            raise PlatformAuthError("x token missing access_token")
+        headers = {"Authorization": f"Bearer {access_token}"}
         text = meta.caption or video_path.stem
-        with httpx.Client(timeout=300) as client:
-            init = _request_with_retry(
+        async with httpx.AsyncClient(timeout=300) as client:
+            init = await _request_with_retry(
                 client,
                 "POST",
                 f"{self.API}/media/upload/initialize",
@@ -351,7 +408,7 @@ class XAdapter(PlatformAdapter):
             with open(video_path, "rb") as fh:
                 index = 0
                 while chunk := fh.read(4 * 1024 * 1024):
-                    append = _request_with_retry(
+                    append = await _request_with_retry(
                         client,
                         "POST",
                         f"{self.API}/media/upload/{media_id}/append",
@@ -364,15 +421,15 @@ class XAdapter(PlatformAdapter):
                         continue
                     raise_api_error(self.name, append)
 
-            finalize = _request_with_retry(
+            finalize = await _request_with_retry(
                 client, "POST", f"{self.API}/media/upload/{media_id}/finalize", headers=headers
             )
             raise_api_error(self.name, finalize)
             processing = finalize.json().get("data", {}).get("processing_info")
             if processing:
-                self._wait_processing(client, media_id, processing, headers)
+                await self._wait_processing(client, media_id, processing, headers)
 
-            tweet = _request_with_retry(
+            tweet = await _request_with_retry(
                 client,
                 "POST",
                 f"{self.API}/tweets",
@@ -389,12 +446,10 @@ class XAdapter(PlatformAdapter):
             raw=tweet.json(),
         )
 
-    def _wait_processing(self, client: httpx.Client, media_id: str, info: dict, headers: dict) -> None:
-        import time
-
+    async def _wait_processing(self, client: httpx.AsyncClient, media_id: str, info: dict, headers: dict) -> None:
         while info.get("state") in ("pending", "in_progress"):
-            time.sleep(info.get("check_after_secs", 5))
-            resp = _request_with_retry(
+            await asyncio.sleep(info.get("check_after_secs", 5))
+            resp = await _request_with_retry(
                 client, "GET", f"{self.API}/media/upload/{media_id}", params={}, headers=headers
             )
             raise_api_error(self.name, resp)
@@ -403,25 +458,28 @@ class XAdapter(PlatformAdapter):
             raise PublishError(f"x media processing failed: {info}")
 
 
-class LinkedInAdapter(PlatformAdapter):
+class LinkedInAdapter(BasePlatformAdapter):
     name = "linkedin"
     API = "https://api.linkedin.com"
 
-    def publish(self, video_path: Path, meta: PlatformConfig) -> PublishResult:
-        from socialdrop.auth.oauth import get_access_token
-
+    async def publish(self, video_path: Path, meta: PlatformConfig, token: dict | None = None) -> PublishResult:
+        if token is None:
+            raise PlatformAuthError("linkedin not authenticated")
+        access_token = token.get("access_token")
+        if not access_token:
+            raise PlatformAuthError("linkedin token missing access_token")
         headers = {
-            "Authorization": f"Bearer {get_access_token('linkedin')}",
+            "Authorization": f"Bearer {access_token}",
             "LinkedIn-Version": "202401",
             "Content-Type": "application/json",
             "X-Restli-Protocol-Version": "2.0.0",
         }
-        with httpx.Client(timeout=300) as client:
-            me = _request_with_retry(client, "GET", f"{self.API}/v2/userinfo", headers=headers)
+        async with httpx.AsyncClient(timeout=300) as client:
+            me = await _request_with_retry(client, "GET", f"{self.API}/v2/userinfo", headers=headers)
             raise_api_error(self.name, me)
             owner_urn = f"urn:li:person:{me.json()['sub']}"
 
-            init = _request_with_retry(
+            init = await _request_with_retry(
                 client,
                 "POST",
                 f"{self.API}/rest/videos?action=initializeUpload",
@@ -438,7 +496,7 @@ class LinkedInAdapter(PlatformAdapter):
                 with open(video_path, "rb") as fh:
                     fh.seek(instruction["byteRange"]["firstByte"])
                     part = fh.read(instruction["byteRange"]["lastByte"] - instruction["byteRange"]["firstByte"] + 1)
-                put = httpx.put(
+                put = await client.put(
                     instruction["uploadUrl"],
                     content=part,
                     headers={"Content-Type": "application/octet-stream"},
@@ -449,7 +507,7 @@ class LinkedInAdapter(PlatformAdapter):
                 if etag:
                     etags.append({"etag": etag})
 
-            finalize = _request_with_retry(
+            finalize = await _request_with_retry(
                 client,
                 "POST",
                 f"{self.API}/rest/videos?action=finalizeUpload",
@@ -465,7 +523,7 @@ class LinkedInAdapter(PlatformAdapter):
             raise_api_error(self.name, finalize)
             video_urn = init_data["video"]
 
-            post = _request_with_retry(
+            post = await _request_with_retry(
                 client,
                 "POST",
                 f"{self.API}/v2/ugcPosts",
@@ -494,68 +552,144 @@ class LinkedInAdapter(PlatformAdapter):
         )
 
 
-class BlueskyAdapter(PlatformAdapter):
+class BlueskyAdapter(BasePlatformAdapter):
     name = "bluesky"
     SERVICE = "https://bsky.social"
 
-    def publish(self, video_path: Path, meta: PlatformConfig) -> PublishResult:
-        import os
-
-        try:
-            from atproto import Client
-        except ImportError as exc:
-            raise PublishError(
-                f"missing dependency; install with: pip install socialdrop[bluesky] ({exc})"
-            ) from exc
-        from socialdrop.auth import store
-
-        token = store.load_token(self.name)
-        caption_parts = [meta.caption or video_path.stem]
-        tags = meta.hashtags or []
-        if tags:
-            caption_parts.append(" ".join(f"#{t.lstrip('#')}" for t in tags))
-        text = "\n\n".join(caption_parts)
-
-        client = Client()
-        if token and token.get("session"):
-            client.login(session_string=token["session"])
-            handle_name = token.get("identifier", "did")
-        elif token and token.get("identifier") and token.get("password"):
-            client.login(token["identifier"], token["password"])
-            handle_name = token["identifier"]
-        else:
-            handle = os.environ.get("SOCIALDROP_BLUESKY_HANDLE")
-            password = os.environ.get("SOCIALDROP_BLUESKY_APP_PASSWORD")
+    async def publish(self, video_path: Path, meta: PlatformConfig, token: dict | None = None) -> PublishResult:
+        if token is None:
+            raise PlatformAuthError("bluesky not authenticated")
+        handle = token.get("identifier") or token.get("handle")
+        password = token.get("password")
+        access_jwt = token.get("accessJwt") or token.get("access_token")
+        did = token.get("did")
+        if not access_jwt or not did:
             if not handle or not password:
-                raise PublishError(
-                    "bluesky not configured; run 'socialdrop auth login bluesky' "
-                    "(uses an app password, never your main password)"
+                raise PlatformAuthError(
+                    "bluesky not configured; set SOCIALDROP_BLUESKY_HANDLE and SOCIALDROP_BLUESKY_APP_PASSWORD"
                 )
-            client.login(handle, password)
-            store.save_token(self.name, {"identifier": handle, "session": client.export_session_string()})
-            handle_name = handle
+            session = await self._login(handle, password)
+            access_jwt = session["accessJwt"]
+            did = session["did"]
+            handle = session["handle"]
+        else:
+            handle = handle or token.get("identifier", "did")
 
-        with open(video_path, "rb") as fh:
-            video_data = fh.read()
-        post = client.send_video(text=text, video=video_data, video_alt="")
-        uri = post.uri if hasattr(post, "uri") else str(post)
+        async with httpx.AsyncClient(timeout=120) as client:
+            blob_ref = await self._upload_blob(client, access_jwt, video_path)
+            caption_parts = [meta.caption or video_path.stem]
+            tags = meta.hashtags or []
+            if tags:
+                caption_parts.append(" ".join(f"#{t.lstrip('#')}" for t in tags))
+            text = "\n\n".join(caption_parts)
+            now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            record = {
+                "repo": did,
+                "collection": "app.bsky.feed.post",
+                "record": {
+                    "text": text,
+                    "createdAt": now,
+                    "embed": {
+                        "$type": "app.bsky.embed.video",
+                        "video": {
+                            "$type": "blob",
+                            "ref": {"$link": blob_ref["ref"]},
+                            "mimeType": blob_ref["mimeType"],
+                            "size": blob_ref["size"],
+                        },
+                    },
+                },
+            }
+            resp = await _request_with_retry(
+                client,
+                "POST",
+                f"{self.SERVICE}/xrpc/com.atproto.repo.createRecord",
+                headers={
+                    "Authorization": f"Bearer {access_jwt}",
+                    "Content-Type": "application/json",
+                },
+                json=record,
+            )
+            if resp.status_code == 401:
+                raise PlatformAuthError(f"bluesky auth failed: {resp.text[:200]}")
+            if resp.status_code >= 400:
+                raise PublishError(f"bluesky createRecord failed {resp.status_code}: {resp.text[:300]}")
+            uri = resp.json().get("uri", "")
         rkey = uri.rsplit("/", 1)[-1]
         return PublishResult(
             platform=self.name,
-            url=f"https://bsky.app/profile/{handle_name}/post/{rkey}",
+            url=f"https://bsky.app/profile/{handle}/post/{rkey}",
             post_id=rkey,
             raw={"uri": uri},
         )
 
-    def is_ready(self) -> tuple[bool, str]:
-        import os
+    async def _login(self, handle: str, password: str) -> dict:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                f"{self.SERVICE}/xrpc/com.atproto.server.createSession",
+                json={"identifier": handle, "password": password},
+            )
+            if resp.status_code == 401:
+                raise PlatformAuthError("bluesky app password rejected")
+            if resp.status_code >= 400:
+                raise PublishError(f"bluesky login failed {resp.status_code}: {resp.text[:300]}")
+            return resp.json()
 
+    async def _upload_blob(self, client: httpx.AsyncClient, access_jwt: str, video_path: Path) -> dict:
+        with open(video_path, "rb") as fh:
+            resp = await _request_with_retry(
+                client,
+                "POST",
+                f"{self.SERVICE}/xrpc/com.atproto.repo.uploadBlob",
+                headers={
+                    "Authorization": f"Bearer {access_jwt}",
+                    "Content-Type": "video/mp4",
+                },
+                content=fh.read(),
+            )
+        if resp.status_code == 401:
+            raise PlatformAuthError("bluesky upload auth failed")
+        if resp.status_code >= 400:
+            raise PublishError(f"bluesky upload failed {resp.status_code}: {resp.text[:300]}")
+        blob = resp.json().get("blob", {})
+        return {
+            "ref": blob.get("ref", {}),
+            "mimeType": blob.get("mimeType", "video/mp4"),
+            "size": blob.get("size", video_path.stat().st_size),
+        }
+
+    async def get_stats(self, post_id: str, meta: PlatformConfig, token: dict | None = None) -> Metrics | None:
+        if token is None:
+            return None
+        did = token.get("did") or token.get("identifier")
+        handle = token.get("identifier") or token.get("handle")
+        if not did or not handle or not post_id:
+            return None
+        uri = f"at://{did}/app.bsky.feed.post/{post_id}"
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(
+                f"{self.SERVICE}/xrpc/app.bsky.feed.getPostThread",
+                params={"uri": uri},
+                headers={"Authorization": f"Bearer {token.get('accessJwt', token.get('access_token', ''))}"},
+            )
+            if resp.status_code == 401:
+                raise PlatformAuthError("bluesky stats auth failed")
+            if resp.status_code >= 400:
+                raise PublishError(f"bluesky stats error {resp.status_code}", retryable=True)
+            thread = resp.json().get("thread", {})
+            post = thread.get("post", {})
+            return Metrics(
+                likes=post.get("likeCount"),
+                comments=post.get("replyCount"),
+                shares=post.get("repostCount"),
+                raw=post,
+            )
+
+    async def is_ready(self) -> tuple[bool, str]:
         from socialdrop.auth.store import load_token
 
         if load_token(self.name) is not None:
             return True, "authenticated"
-        if os.environ.get("SOCIALDROP_BLUESKY_HANDLE") and os.environ.get("SOCIALDROP_BLUESKY_APP_PASSWORD"):
-            return True, "app password via environment"
         return False, "run 'socialdrop auth login bluesky' (app password)"
 
 

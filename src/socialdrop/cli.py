@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import typer
@@ -27,6 +28,20 @@ def _folder(path: str) -> Path:
 
 
 @app.command()
+def init(
+    platforms_raw: str | None = typer.Option(None, "--platforms", "-p", help="Comma-separated platforms to configure."),
+    non_interactive: bool = typer.Option(False, "--non-interactive", help="Fail if any required env var is missing."),
+) -> None:
+    """Initialize .env and prompt for missing credentials."""
+    from socialdrop.init_cmd import run_init
+
+    platforms = None
+    if platforms_raw:
+        platforms = [p.strip() for p in platforms_raw.split(",") if p.strip()]
+    run_init(platforms, non_interactive)
+
+
+@app.command()
 def version() -> None:
     console.print(f"socialdrop {__version__}")
 
@@ -38,28 +53,31 @@ def doctor(folder: Path = typer.Argument(Path("."), help="Folder to scan.")) -> 
     from socialdrop.platforms.registry import all_adapters
     from socialdrop.schema import find_drops, validate_drop_file
 
-    table = Table(title="Platform status")
-    table.add_column("Platform", style="cyan")
-    table.add_column("Ready", style="bold")
-    table.add_column("Detail")
-    for adapter in all_adapters():
-        ready, detail = adapter.is_ready()
-        table.add_row(adapter.name, "✅" if ready else "—", detail)
-    console.print(table)
-    console.print(f"Token storage: [bold]{store.storage_backend()}[/bold]")
+    async def _run() -> None:
+        table = Table(title="Platform status")
+        table.add_column("Platform", style="cyan")
+        table.add_column("Ready", style="bold")
+        table.add_column("Detail")
+        for adapter in all_adapters():
+            ready, detail = await adapter.is_ready()
+            table.add_row(adapter.name, "✅" if ready else "—", detail)
+        console.print(table)
+        console.print(f"Token storage: [bold]{store.storage_backend()}[/bold]")
 
-    md_files = find_drops(_folder(str(folder)))
-    problems: list[str] = []
-    for md_path in md_files:
-        problems.extend(validate_drop_file(md_path))
-    if not md_files:
-        console.print("[yellow]No .md drop files found.[/yellow]")
-        return
-    if problems:
-        for problem in problems:
-            console.print(f"[red]✗ {problem}[/red]")
-        raise typer.Exit(1)
-    console.print(f"[green]✓ {len(md_files)} drop file(s) valid[/green]")
+        md_files = find_drops(_folder(str(folder)))
+        problems: list[str] = []
+        for md_path in md_files:
+            problems.extend(validate_drop_file(md_path))
+        if not md_files:
+            console.print("[yellow]No .md drop files found.[/yellow]")
+            return
+        if problems:
+            for problem in problems:
+                console.print(f"[red]✗ {problem}[/red]")
+            raise typer.Exit(1)
+        console.print(f"[green]✓ {len(md_files)} drop file(s) valid[/green]")
+
+    asyncio.run(_run())
 
 
 @app.command()
@@ -71,13 +89,16 @@ def publish(
     """Scan FOLDER and publish every due video drop."""
     from socialdrop.publisher import publish_folder
 
-    results = publish_folder(_folder(str(folder)), only=only, respect_schedule=not ignore_schedule)
-    color = "green" if results["failed"] == 0 else "red"
-    console.print(
-        f"[{color}]published={results['published']} failed={results['failed']} "
-        f"waiting={results['skipped']}[/{color}]"
-    )
-    raise typer.Exit(0 if results["failed"] == 0 else 1)
+    async def _run() -> None:
+        results = await publish_folder(_folder(str(folder)), only=only, respect_schedule=not ignore_schedule)
+        color = "green" if results["failed"] == 0 else "red"
+        console.print(
+            f"[{color}]published={results['published']} failed={results['failed']} "
+            f"waiting={results['skipped']}[/{color}]"
+        )
+        raise typer.Exit(0 if results["failed"] == 0 else 1)
+
+    asyncio.run(_run())
 
 
 @app.command()
@@ -86,18 +107,19 @@ def stats(
     loop_minutes: int = typer.Option(0, help="Resync forever every N minutes."),
 ) -> None:
     """Pull per-platform metrics and write Insights tables into each md file."""
-    import time as time_mod
-
     from socialdrop.publisher import sync_folder_stats
 
-    target = _folder(str(folder))
-    while True:
-        count = sync_folder_stats(target)
-        if count == 0:
-            console.print("[yellow]no published videos with metrics yet[/yellow]")
-        if loop_minutes <= 0:
-            return
-        time_mod.sleep(loop_minutes * 60)
+    async def _run() -> None:
+        target = _folder(str(folder))
+        while True:
+            count = await sync_folder_stats(target)
+            if count == 0:
+                console.print("[yellow]no published videos with metrics yet[/yellow]")
+            if loop_minutes <= 0:
+                return
+            asyncio.run(asyncio.sleep(loop_minutes * 60))
+
+    asyncio.run(_run())
 
 
 @app.command()
@@ -105,7 +127,7 @@ def watch(folder: Path = typer.Argument(Path("."), help="Drop folder.")) -> None
     """Live-watch FOLDER; new video+md pairs publish automatically."""
     from socialdrop.watcher import watch_folder
 
-    watch_folder(_folder(str(folder)))
+    asyncio.run(watch_folder(_folder(str(folder))))
 
 
 @app.command()
@@ -113,7 +135,7 @@ def demo(out_dir: Path = typer.Argument(Path("demo"), help="Output folder.")) ->
     """Create a sample drop folder and run it end-to-end against the mock platform."""
     from socialdrop.demo import run_demo
 
-    run_demo(Path(out_dir))
+    asyncio.run(run_demo(Path(out_dir)))
 
 
 @auth_app.command("login")

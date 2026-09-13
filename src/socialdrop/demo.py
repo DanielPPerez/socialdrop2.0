@@ -21,7 +21,7 @@ Add real platforms like `youtube`, `tiktok`, `instagram`, `x`, `linkedin`,
 """
 
 
-def run_demo(out_dir: Path) -> None:
+async def run_demo(out_dir: Path) -> None:
     out_dir.mkdir(exist_ok=True)
     md_path = out_dir / "my-first-video.md"
     video_path = out_dir / "my-first-video.mp4"
@@ -36,8 +36,8 @@ def run_demo(out_dir: Path) -> None:
 
     from socialdrop.publisher import publish_drop, sync_folder_stats
 
-    outcome = publish_drop(md_path, force=True)
-    sync_folder_stats(out_dir)
+    outcome = await publish_drop(md_path, force=True)
+    await sync_folder_stats(out_dir)
     state = outcome["state"]
     console.print()
     console.print(f"[bold green]Demo complete — status: {state.status}[/bold green]")
