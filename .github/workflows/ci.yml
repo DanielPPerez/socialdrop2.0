@@ -18,13 +18,20 @@ jobs:
       - run: ruff check src/socialdrop tests
       - run: mypy src/socialdrop tests
       - run: pytest tests/ --cov=socialdrop --cov-report=xml --cov-fail-under=60
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: coverage.xml
+          retention-days: 1
 
   codecov:
     needs: test
     runs-on: ubuntu-latest
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: coverage-xml
       - uses: codecov/codecov-action@v4
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
