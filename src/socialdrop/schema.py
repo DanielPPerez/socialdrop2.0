@@ -29,6 +29,7 @@ class VideoMeta(BaseModel):
     platforms: dict[str, PlatformConfig]
     hashtags: list[str] = Field(default_factory=list)
     description: str | None = None
+    public: bool = False
 
     @property
     def platform_names(self) -> list[str]:

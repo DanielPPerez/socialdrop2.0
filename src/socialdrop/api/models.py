@@ -16,6 +16,7 @@ class DropCreate(BaseModel):
     platforms: dict[str, PlatformConfig]
     hashtags: list[str] = []
     body: str = ""
+    public: bool = False
 
 
 class InsightsRow(BaseModel):
@@ -33,6 +34,29 @@ class DropOut(DropCreate):
     status: Literal["draft", "scheduled", "publishing", "published", "failed"]
     published: list[PublishResult] = []
     insights: list[InsightsRow] = []
+
+
+class PublicDropOut(BaseModel):
+    id: str
+    title: str
+    thumbnail_url: str | None = None
+    platforms: list[dict[str, str]]  # [{"name": "youtube", "url": "https://..."}]
+    published_at: datetime | None = None
+
+
+class User(BaseModel):
+    id: str
+    email: str
+    name: str | None = None
+    avatar_url: str | None = None
+    created_at: datetime
+
+
+class PlatformConnection(BaseModel):
+    user_id: str
+    platform: str
+    account_label: str | None = None
+    connected_at: datetime
 
 
 class PlatformStatus(BaseModel):

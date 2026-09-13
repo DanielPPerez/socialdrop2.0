@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import secrets
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
@@ -33,9 +34,17 @@ from socialdrop.api.models import (
     DropOut,
     ErrorResponse,
     InsightsRow,
+    PlatformConnection,
     PlatformStatus,
+    PublicDropOut,
+    User,
 )
 from socialdrop.auth import oauth, store
+from socialdrop.auth.connections import (
+    load_connection,
+    load_user_connections,
+    save_connection,
+)
 from socialdrop.auth.oauth import OAUTH_CONFIGS, generate_pkce_pair
 from socialdrop.jobs import Job, JobQueue
 from socialdrop.notifier import DiscordWebhook, EmailSMTP, Notifier
@@ -177,6 +186,7 @@ def _drop_to_out(drop_path: Path, state: DropState | None) -> DropOut:
         platforms=drop.meta.platforms,
         hashtags=drop.meta.hashtags,
         body=body,
+        public=drop.meta.public,
         status=_map_status(state),
         published=published,
         insights=insights,
@@ -353,13 +363,15 @@ async def create_drop(
         schedule_str = data.schedule.strftime("%Y-%m-%d %H:%M") + f" {data.timezone}"
     md_content = f"""---
 title: {data.title}
-schedule: \"{schedule_str}\"
+schedule: "{schedule_str}"
 platforms:
 """
     for name in data.platforms.keys():
         md_content += f"  {name}: {{}}\n"
     if data.hashtags:
         md_content += f"hashtags: {data.hashtags}\n"
+    if data.public:
+        md_content += "public: true\n"
     md_content += "---\n"
     md_content += data.body + "\n"
     md_path.write_text(md_content, encoding="utf-8")
@@ -423,6 +435,85 @@ async def delete_drop(drop_id: str) -> None:
     if video and video.exists():
         video.unlink()
     return None
+
+
+def _current_user_id(request: Request) -> str:
+    """Get user identifier from API key (placeholder for real auth in Phase B)."""
+    api_key = request.headers.get("x-api-key", "")
+    if not api_key:
+        return "anonymous"
+    # Use a hash of the API key as user ID for now
+    import hashlib
+    return hashlib.sha256(api_key.encode()).hexdigest()[:16]
+
+
+@router.get("/me", response_model=User, dependencies=[Depends(_require_api_key)])
+async def get_me(request: Request) -> User:
+    user_id = _current_user_id(request)
+    # Placeholder user - in Phase B this will come from auth session
+    return User(
+        id=user_id,
+        email=f"{user_id}@socialdrop.local",
+        name="API User",
+        avatar_url=None,
+        created_at=datetime.now(timezone.utc),
+    )
+
+
+@router.get("/me/connections", response_model=list[PlatformConnection], dependencies=[Depends(_require_api_key)])
+async def get_my_connections(request: Request) -> list[PlatformConnection]:
+    user_id = _current_user_id(request)
+    connections = load_user_connections(user_id)
+    result: list[PlatformConnection] = []
+    for conn in connections:
+        result.append(
+            PlatformConnection(
+                user_id=conn["user_id"],
+                platform=conn["platform"],
+                account_label=conn.get("account_label"),
+                connected_at=datetime.fromisoformat(conn["connected_at"]),
+            )
+        )
+    return result
+
+
+@router.get("/public/drops", response_model=list[PublicDropOut])
+async def list_public_drops() -> list[PublicDropOut]:
+    """Public endpoint - no API key required. Returns only drops with public=true."""
+    _get_drops_folder().mkdir(parents=True, exist_ok=True)
+    out: list[PublicDropOut] = []
+    for md_path in find_drops(_get_drops_folder()):
+        drop = load_drop(md_path)
+        if not drop.meta.public:
+            continue
+        state = load_state(md_path)
+        # Find published platforms with URLs
+        published_platforms: list[dict[str, str]] = []
+        if state:
+            for name, attempt in state.platforms.items():
+                if attempt.status == "published" and attempt.url:
+                    published_platforms.append({"name": name, "url": attempt.url})
+        # Get published_at from the earliest published platform
+        published_at: datetime | None = None
+        if state:
+            for attempt in state.platforms.values():
+                if attempt.status == "published" and attempt.published_at:
+                    try:
+                        dt = datetime.fromisoformat(attempt.published_at.replace("Z", "+00:00"))
+                        if published_at is None or dt < published_at:
+                            published_at = dt
+                    except Exception:
+                        pass
+        out.append(
+            PublicDropOut(
+                id=md_path.stem,
+                title=drop.meta.title,
+                thumbnail_url=None,  # Could be enhanced later
+                platforms=published_platforms,
+                published_at=published_at,
+            )
+        )
+    return out
 
 
 @router.post("/drops/suggest", dependencies=[Depends(_require_api_key)])
