@@ -30,6 +30,8 @@ from socialdrop.api.events import event_manager
 from socialdrop.api.models import (
     AuthCallbackResponse,
     AuthStartResponse,
+    AuthSyncRequest,
+    AuthSyncResponse,
     DropCreate,
     DropOut,
     ErrorResponse,
@@ -44,6 +46,13 @@ from socialdrop.auth.connections import (
     load_connection,
     load_user_connections,
     save_connection,
+)
+from socialdrop.auth.jwt_auth import (
+    create_api_token,
+    create_user_if_not_exists,
+    get_user_by_id,
+    is_local_mode,
+    verify_api_token,
 )
 from socialdrop.auth.oauth import OAUTH_CONFIGS, generate_pkce_pair
 from socialdrop.jobs import Job, JobQueue
@@ -81,6 +90,51 @@ def _require_api_key(request: Request) -> None:
     key = request.headers.get("x-api-key", "")
     if not _api_key() or key != _api_key():
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key")
+
+
+def _get_bearer_token(request: Request) -> str | None:
+    auth = request.headers.get("authorization", "")
+    if auth.lower().startswith("bearer "):
+        return auth[7:]
+    return None
+
+
+def _require_auth(request: Request) -> str:
+    """Get user_id from Bearer token. In local mode, returns fixed user_id."""
+    if is_local_mode():
+        return "local-user"
+    
+    token = _get_bearer_token(request)
+    if not token:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing Bearer token")
+    
+    user_id = verify_api_token(token)
+    if not user_id:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired token")
+    
+    return user_id
+
+
+def _optional_auth(request: Request) -> str | None:
+    """Optional auth - returns user_id if valid token, None otherwise."""
+    if is_local_mode():
+        return "local-user"
+    
+    token = _get_bearer_token(request)
+    if not token:
+        return None
+    
+    return verify_api_token(token)
+
+
+def _current_user_id(request: Request) -> str:
+    """Get user identifier from API key (placeholder for real auth in Phase B)."""
+    api_key = request.headers.get("x-api-key", "")
+    if not api_key:
+        return "anonymous"
+    # Use a hash of the API key as user ID for now
+    import hashlib
+    return hashlib.sha256(api_key.encode()).hexdigest()[:16]
 
 
 def _map_status(state: DropState | None) -> Literal["draft", "scheduled", "publishing", "published", "failed"]:
@@ -437,46 +491,6 @@ async def delete_drop(drop_id: str) -> None:
     return None
 
 
-def _current_user_id(request: Request) -> str:
-    """Get user identifier from API key (placeholder for real auth in Phase B)."""
-    api_key = request.headers.get("x-api-key", "")
-    if not api_key:
-        return "anonymous"
-    # Use a hash of the API key as user ID for now
-    import hashlib
-    return hashlib.sha256(api_key.encode()).hexdigest()[:16]
-
-
-@router.get("/me", response_model=User, dependencies=[Depends(_require_api_key)])
-async def get_me(request: Request) -> User:
-    user_id = _current_user_id(request)
-    # Placeholder user - in Phase B this will come from auth session
-    return User(
-        id=user_id,
-        email=f"{user_id}@socialdrop.local",
-        name="API User",
-        avatar_url=None,
-        created_at=datetime.now(timezone.utc),
-    )
-
-
-@router.get("/me/connections", response_model=list[PlatformConnection], dependencies=[Depends(_require_api_key)])
-async def get_my_connections(request: Request) -> list[PlatformConnection]:
-    user_id = _current_user_id(request)
-    connections = load_user_connections(user_id)
-    result: list[PlatformConnection] = []
-    for conn in connections:
-        result.append(
-            PlatformConnection(
-                user_id=conn["user_id"],
-                platform=conn["platform"],
-                account_label=conn.get("account_label"),
-                connected_at=datetime.fromisoformat(conn["connected_at"]),
-            )
-        )
-    return result
-
-
 @router.get("/public/drops", response_model=list[PublicDropOut])
 async def list_public_drops() -> list[PublicDropOut]:
     """Public endpoint - no API key required. Returns only drops with public=true."""
@@ -516,7 +530,50 @@ async def list_public_drops() -> list[PublicDropOut]:
     return out
 
 
-@router.post("/drops/suggest", dependencies=[Depends(_require_api_key)])
+@router.post("/auth/sync", response_model=AuthSyncResponse)
+async def auth_sync(data: AuthSyncRequest) -> AuthSyncResponse:
+    """Sync user from Google OAuth - creates user if not exists, returns API token."""
+    user_id, created = create_user_if_not_exists(
+        email=data.email,
+        name=data.name,
+        avatar_url=data.avatar_url,
+        google_sub=data.google_sub,
+    )
+    api_token = create_api_token(user_id)
+    return AuthSyncResponse(api_token=api_token, user_id=user_id)
+
+
+@router.get("/me", response_model=User, dependencies=[Depends(_require_auth)])
+async def get_me(request: Request, user_id: str = Depends(_require_auth)) -> User:
+    user = get_user_by_id(user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return User(
+        id=user["id"],
+        email=user["email"],
+        name=user.get("name"),
+        avatar_url=user.get("avatar_url"),
+        created_at=datetime.fromisoformat(user["created_at"]),
+    )
+
+
+@router.get("/me/connections", response_model=list[PlatformConnection], dependencies=[Depends(_require_auth)])
+async def get_my_connections(request: Request, user_id: str = Depends(_require_auth)) -> list[PlatformConnection]:
+    connections = load_user_connections(user_id)
+    result: list[PlatformConnection] = []
+    for conn in connections:
+        result.append(
+            PlatformConnection(
+                user_id=conn["user_id"],
+                platform=conn["platform"],
+                account_label=conn.get("account_label"),
+                connected_at=datetime.fromisoformat(conn["connected_at"]),
+            )
+        )
+    return result
+
+
+@router.post("/drops/suggest", dependencies=[Depends(_require_auth)])
 async def suggest_drop(video: UploadFile = File(...)) -> dict[str, Any]:
     from socialdrop.ai import suggest_from_video
 

@@ -80,3 +80,15 @@ class ErrorResponse(BaseModel):
     error: str
     platform: str | None = None
     detail: str | None = None
+
+
+class AuthSyncRequest(BaseModel):
+    email: str
+    name: str | None = None
+    avatar_url: str | None = None
+    google_sub: str
+
+
+class AuthSyncResponse(BaseModel):
+    api_token: str
+    user_id: str
