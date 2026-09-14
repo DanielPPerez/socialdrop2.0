@@ -293,9 +293,9 @@ async def list_platforms() -> list[PlatformStatus]:
 @router.post(
     "/platforms/{platform}/auth/start",
     response_model=AuthStartResponse,
-    dependencies=[Depends(_require_api_key)],
+    dependencies=[Depends(_require_auth)],
 )
-async def start_auth(platform: str) -> AuthStartResponse:
+async def start_auth(platform: str, user_id: str = Depends(_require_auth)) -> AuthStartResponse:
     cfg = OAUTH_CONFIGS.get(platform)
     if cfg is None:
         raise HTTPException(
@@ -307,7 +307,7 @@ async def start_auth(platform: str) -> AuthStartResponse:
     verifier = None
     if cfg.use_pkce:
         verifier, challenge = generate_pkce_pair()
-    AUTH_SESSIONS[state] = {"platform": platform, "verifier": verifier}
+    AUTH_SESSIONS[state] = {"platform": platform, "verifier": verifier, "user_id": user_id}
     params = {
         "client_id": oauth.client_id_for(cfg),
         "redirect_uri": redirect_uri,
@@ -328,12 +328,16 @@ async def start_auth(platform: str) -> AuthStartResponse:
 @router.get(
     "/platforms/{platform}/auth/callback",
     response_model=AuthCallbackResponse,
-    dependencies=[Depends(_require_api_key)],
 )
 async def auth_callback(platform: str, code: str = Query(...), state: str = Query(...)) -> AuthCallbackResponse:
     session = AUTH_SESSIONS.pop(state, None)
     if not session or session.get("platform") != platform:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid state")
+    
+    user_id = session.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing user_id in session")
+    
     cfg = OAUTH_CONFIGS.get(platform)
     if cfg is None:
         raise HTTPException(
@@ -350,7 +354,9 @@ async def auth_callback(platform: str, code: str = Query(...), state: str = Quer
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Auth failed: {exc}",
         ) from exc
-    store.save_token(platform, token)
+    store.save_token(platform, token, account_id=user_id)
+    from socialdrop.auth.connections import save_connection
+    save_connection(user_id, platform)
     await event_manager.publish(
         {"drop_id": "", "status": "auth", "message": f"{platform} authenticated", "ts": ""}
     )
@@ -571,6 +577,24 @@ async def get_my_connections(request: Request, user_id: str = Depends(_require_a
             )
         )
     return result
+
+
+@router.delete("/me/connections/{platform}", dependencies=[Depends(_require_auth)])
+async def delete_my_connection(request: Request, platform: str, user_id: str = Depends(_require_auth)) -> dict[str, str]:
+    """Disconnect a platform: revoke token and delete connection record."""
+    from socialdrop.auth import store
+    from socialdrop.auth.connections import delete_connection
+    
+    # Delete the OAuth token
+    try:
+        store.delete_token(platform, account_id=user_id)
+    except Exception:
+        pass  # Token might not exist, continue
+    
+    # Delete the connection record
+    delete_connection(user_id, platform)
+    
+    return {"status": "ok", "detail": f"{platform} disconnected"}
 
 
 @router.post("/drops/suggest", dependencies=[Depends(_require_auth)])

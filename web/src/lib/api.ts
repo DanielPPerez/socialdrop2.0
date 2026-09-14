@@ -189,4 +189,8 @@ export const api = {
   async getConnections(): Promise<PlatformConnection[]> {
     return fetchWithAuth("/api/v1/me/connections")
   },
+
+  async deleteConnection(platform: string): Promise<void> {
+    await fetchWithAuth(`/api/v1/me/connections/${platform}`, { method: "DELETE" })
+  },
 }

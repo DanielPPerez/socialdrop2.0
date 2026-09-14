@@ -8,6 +8,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from socialdrop.api.main import app
+from socialdrop.auth.jwt_auth import create_api_token, create_user_if_not_exists
 from socialdrop.jobs import Job
 from socialdrop.platforms.adapters import MockAdapter
 from socialdrop.platforms.exceptions import PlatformAuthError
@@ -20,6 +21,17 @@ def _client() -> AsyncClient:
 
 def _headers() -> dict[str, str]:
     return {"x-api-key": "test-key"}
+
+
+def _bearer_headers() -> dict[str, str]:
+    # Create a test user and get a Bearer token
+    user_id, _ = create_user_if_not_exists(
+        email="test@example.com",
+        name="Test User",
+        google_sub="test-google-sub-123",
+    )
+    token = create_api_token(user_id)
+    return {"Authorization": f"Bearer {token}"}
 
 
 def _setup_api_key() -> None:
@@ -64,7 +76,7 @@ async def test_start_auth():
     os.environ["SOCIALDROP_YOUTUBE_CLIENT_ID"] = "dummy"
     with patch.dict("socialdrop.api.main.OAUTH_CONFIGS", {"youtube": cfg}, clear=True):
         async with _client() as client:
-            resp = await client.post("/api/v1/platforms/youtube/auth/start", headers=_headers())
+            resp = await client.post("/api/v1/platforms/youtube/auth/start", headers=_bearer_headers())
             assert resp.status_code == 200
             data = resp.json()
             assert "authorize_url" in data
@@ -78,7 +90,8 @@ async def test_auth_callback():
     state = "abc123"
     from socialdrop.api.main import AUTH_SESSIONS
 
-    AUTH_SESSIONS[state] = {"platform": "youtube", "verifier": "verifier"}
+    # Include user_id in the session
+    AUTH_SESSIONS[state] = {"platform": "youtube", "verifier": "verifier", "user_id": "test-user-id"}
     mock_token = {"access_token": "ya29.abc", "expires_at": 9999999999}
     with patch("socialdrop.api.main.oauth.run_authorization_code_flow", return_value=mock_token) as mock_flow:
         with patch("socialdrop.api.main.store.save_token"):
@@ -86,7 +99,7 @@ async def test_auth_callback():
                 resp = await client.get(
                     "/api/v1/platforms/youtube/auth/callback",
                     params={"code": "code123", "state": state},
-                    headers=_headers(),
+                    # Callback doesn't need auth headers - uses state
                 )
                 assert resp.status_code == 200
                 data = resp.json()
