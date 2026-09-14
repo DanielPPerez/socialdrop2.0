@@ -23,6 +23,7 @@ from fastapi import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 from starlette import status
 
 from socialdrop import __version__
@@ -361,6 +362,76 @@ async def auth_callback(platform: str, code: str = Query(...), state: str = Quer
         {"drop_id": "", "status": "auth", "message": f"{platform} authenticated", "ts": ""}
     )
     return AuthCallbackResponse(status="ok", detail=f"{platform} token stored")
+
+
+@router.get("/mode", response_model=dict)
+async def get_mode() -> dict[str, str]:
+    """Returns the current deployment mode: 'local' or 'cloud'."""
+    return {"mode": "local" if is_local_mode() else "cloud"}
+
+
+class EnvUpdateRequest(BaseModel):
+    vars: dict[str, str]
+
+
+@router.put("/local/env", dependencies=[Depends(_require_auth)])
+async def update_local_env(data: EnvUpdateRequest, user_id: str = Depends(_require_auth)) -> dict[str, str]:
+    """Update local .env file with provided environment variables.
+    Only available in local mode (SOCIALDROP_MODE=local)."""
+    if not is_local_mode():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not available in cloud mode")
+    
+    env_file = Path(".env")
+    existing_vars: dict[str, str] = {}
+    
+    # Read existing .env
+    if env_file.exists():
+        for line in env_file.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, value = line.split("=", 1)
+                existing_vars[key.strip()] = value.strip()
+    
+    # Update with new values
+    for key, value in data.vars.items():
+        if value:
+            existing_vars[key] = value
+        elif key in existing_vars:
+            del existing_vars[key]
+    
+    # Write back
+    lines = []
+    for key in sorted(existing_vars.keys()):
+        lines.append(f"{key}={existing_vars[key]}")
+    env_file.write_text("\n".join(lines) + "\n")
+    
+    # Update os.environ for current process
+    for key, value in data.vars.items():
+        if value:
+            os.environ[key] = value
+        elif key in os.environ:
+            del os.environ[key]
+    
+    return {"status": "ok", "detail": f"Updated {len(data.vars)} variables"}
+
+
+@router.get("/local/env", response_model=dict)
+async def get_local_env(user_id: str = Depends(_require_auth)) -> dict[str, str]:
+    """Get current .env variables. Only available in local mode."""
+    if not is_local_mode():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not available in cloud mode")
+    
+    env_file = Path(".env")
+    existing_vars: dict[str, str] = {}
+    
+    if env_file.exists():
+        for line in env_file.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, value = line.split("=", 1)
+                existing_vars[key.strip()] = value.strip()
+    
+    return existing_vars
 
 
 JOB_QUEUE = JobQueue()

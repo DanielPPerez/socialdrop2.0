@@ -193,4 +193,38 @@ export const api = {
   async deleteConnection(platform: string): Promise<void> {
     await fetchWithAuth(`/api/v1/me/connections/${platform}`, { method: "DELETE" })
   },
+
+  async getMode(): Promise<{ mode: "local" | "cloud" }> {
+    const res = await fetch(`${API_URL}/api/v1/mode`, { cache: "no-store" })
+    if (!res.ok) throw new Error("Failed to fetch mode")
+    return res.json()
+  },
+
+  async updateLocalEnv(vars: Record<string, string>): Promise<{ status: string; detail: string }> {
+    const token = await getApiToken()
+    const isLocalMode = process.env.SOCIALDROP_MODE === "local"
+
+    const headers: HeadersInit = {
+      "Content-Type": "application/json",
+    }
+    if (token && !isLocalMode) {
+      headers["Authorization"] = `Bearer ${token}`
+    } else if (isLocalMode) {
+      const localKey = process.env.SOCIALDROP_API_KEY
+      if (localKey) headers["X-API-Key"] = localKey
+    }
+
+    const res = await fetch(`${API_URL}/api/v1/local/env`, {
+      method: "PUT",
+      headers,
+      body: JSON.stringify({ vars }),
+    })
+
+    if (!res.ok) {
+      const error = await res.json().catch(() => ({ error: "Unknown error" }))
+      throw new Error(error.error || `HTTP ${res.status}`)
+    }
+
+    return res.json()
+  },
 }

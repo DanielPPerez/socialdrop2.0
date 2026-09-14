@@ -92,3 +92,7 @@ class AuthSyncRequest(BaseModel):
 class AuthSyncResponse(BaseModel):
     api_token: str
     user_id: str
+
+
+class EnvUpdateRequest(BaseModel):
+    vars: dict[str, str]
